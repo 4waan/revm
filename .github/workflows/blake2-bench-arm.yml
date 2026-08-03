@@ -1,0 +1,97 @@
+name: blake2 A/B (arm64)
+
+# Two triggers:
+#  - push to the bench branch: fires as soon as you push, and works even though
+#    this file is not on the default branch.
+#  - workflow_dispatch: the manual "Run workflow" button. NOTE this button only
+#    appears if the workflow file also exists on the repo's DEFAULT branch --
+#    that is a GitHub rule, not a mistake in this file. The push trigger is the
+#    way around it.
+on:
+  push:
+    branches: [bench/blake2-arm]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to compare against main"
+        required: false
+        default: "perf/blake2-portable-const-schedule"
+      filter:
+        description: "Criterion benchmark filter"
+        required: false
+        default: "blake2"
+
+permissions: {}
+
+# `inputs` is empty on a push trigger, so fall back to literals. Set once here
+# and used by both benchmark steps below.
+env:
+  BRANCH: ${{ inputs.branch || 'perf/blake2-portable-const-schedule' }}
+  FILTER: ${{ inputs.filter || 'blake2' }}
+
+jobs:
+  ab:
+    # This is the whole point: a native aarch64 runner, free for public repos.
+    # There is no NEON path in revm's blake2, so this executes portable::compress.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # fetch-depth: 0 pulls full history. The default (1) is a shallow clone
+          # with only one commit, and this job needs to check out BOTH main and
+          # the feature branch.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo and target/ between runs so later runs skip dependency
+      # rebuilds. First run will still be slow (~10 min of compiling).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Sanity check. If this does not say aarch64, everything below is measuring
+      # the AVX2 path and the results are meaningless for this change.
+      - name: Confirm architecture and CPU
+        run: |
+          uname -m
+          lscpu | head -20
+
+      # ---- half 1: baseline on main -----------------------------------------
+      # --save-baseline writes timings into target/criterion/<bench>/main/.
+      # target/ survives across steps in the same job, which is what makes the
+      # second half able to compare against it.
+      - name: Benchmark main
+        run: |
+          git checkout main
+          git log --oneline -1
+          cargo bench --bench bench -p revm-precompile -- \
+            --save-baseline main "$FILTER"
+
+      # ---- half 2: the branch, compared against that baseline ---------------
+      # --baseline (no "save") reads the stored timings and prints the percentage
+      # change plus a 95% confidence interval for each benchmark.
+      - name: Benchmark branch vs main
+        run: |
+          git checkout "$BRANCH"
+          git log --oneline -1
+          cargo bench --bench bench -p revm-precompile -- \
+            --baseline main "$FILTER"
+
+      # Optional but recommended: a second pass. Two independent runs agreeing is
+      # far more convincing than one, especially on a shared-vCPU runner.
+      - name: Second pass (repeatability check)
+        run: |
+          cargo bench --bench bench -p revm-precompile -- \
+            --baseline main "$FILTER"
+
+      # Raw criterion data, in case you want the estimates.json numbers later.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-data
+          path: target/criterion/
+          retention-days: 7
